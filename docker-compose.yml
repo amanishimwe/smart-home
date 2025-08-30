@@ -1,0 +1,87 @@
+version: '3.8'
+
+services:
+  # API Gateway
+  api-gateway:
+    build: ./api-gateway
+    ports:
+      - "8000:8000"
+    environment:
+      - SECRET_KEY=your-secret-key-here-change-in-production
+    depends_on:
+      - auth-service
+      - user-service
+      - telemetry-service
+      - ai-service
+    networks:
+      - smart-home-network
+
+  # Authentication Service
+  auth-service:
+    build: ./auth-service
+    ports:
+      - "8001:8001"
+    environment:
+      - SECRET_KEY=your-secret-key-here-change-in-production
+    volumes:
+      - auth-data:/app/data
+    networks:
+      - smart-home-network
+
+  # User Service
+  user-service:
+    build: ./user-service
+    ports:
+      - "8002:8002"
+    environment:
+      - SECRET_KEY=your-secret-key-here-change-in-production
+    volumes:
+      - user-data:/app/data
+    networks:
+      - smart-home-network
+
+  # Telemetry Service
+  telemetry-service:
+    build: ./telemetry-service
+    ports:
+      - "8003:8003"
+    environment:
+      - SECRET_KEY=your-secret-key-here-change-in-production
+    volumes:
+      - telemetry-data:/app/data
+    networks:
+      - smart-home-network
+
+  # AI Service
+  ai-service:
+    build: ./ai-service
+    ports:
+      - "8004:8004"
+    environment:
+      - SECRET_KEY=your-secret-key-here-change-in-production
+    volumes:
+      - ai-data:/app/data
+    networks:
+      - smart-home-network
+
+  # Frontend (React)
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    depends_on:
+      - api-gateway
+    networks:
+      - smart-home-network
+
+volumes:
+  auth-data:
+  user-data:
+  telemetry-data:
+  ai-data:
+
+networks:
+  smart-home-network:
+    driver: bridge
