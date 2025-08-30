@@ -1,5 +1,5 @@
 // src/services/auth.js
-const API_BASE_URL = 'http://localhost:8000'; // API Gateway
+const API_BASE_URL = 'http://localhost:8001'; // API Gateway
 
 class AuthService {
     constructor() {
@@ -20,7 +20,7 @@ class AuthService {
     // Login user
     async login(username, password, rememberMe = false) {
         try {
-            const response = await fetch(`${API_BASE_URL}/auth/login`, {
+            const response = await fetch(`${API_BASE_URL}/login`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -56,7 +56,7 @@ class AuthService {
     // Register user
     async register(username, email, password, role = 'user') {
         try {
-            const response = await fetch(`${API_BASE_URL}/auth/register`, {
+            const response = await fetch(`${API_BASE_URL}/register`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
