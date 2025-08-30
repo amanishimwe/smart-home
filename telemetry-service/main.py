@@ -41,10 +41,26 @@ def init_db():
     conn = sqlite3.connect('telemetry.db')
     cursor = conn.cursor()
     
-    # Create telemetry table
+    # Create user_devices table for user-device mapping
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_devices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id VARCHAR(100) NOT NULL,  -- username from auth service
+            device_id VARCHAR(100) NOT NULL,
+            device_name VARCHAR(100),
+            device_type VARCHAR(50),
+            location VARCHAR(100),
+            is_active BOOLEAN DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, device_id)
+        )
+    ''')
+    
+    # Create telemetry table with user_id
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS telemetry (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id VARCHAR(100) NOT NULL,  -- username from auth service
             device_id VARCHAR(100) NOT NULL,
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             energy_usage REAL NOT NULL,
@@ -59,9 +75,27 @@ def init_db():
     ''')
     
     # Create indexes for better query performance
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_id ON telemetry(user_id)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_device_id ON telemetry(device_id)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON telemetry(timestamp)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_device_timestamp ON telemetry(device_id, timestamp)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_device ON telemetry(user_id, device_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_device_timestamp ON telemetry(user_id, device_id, timestamp)')
+    
+    # Add user_id column to existing telemetry table if it doesn't exist
+    try:
+        cursor.execute('ALTER TABLE telemetry ADD COLUMN user_id VARCHAR(100)')
+        # Set default user_id for existing data (migration)
+        cursor.execute('UPDATE telemetry SET user_id = "default_user" WHERE user_id IS NULL')
+    except sqlite3.OperationalError:
+        # Column already exists
+        pass
+    
+    # Create indexes after ensuring column exists
+    try:
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_id ON telemetry(user_id)')
+    except sqlite3.OperationalError:
+        # Index creation failed, skip
+        pass
     
     conn.commit()
     conn.close()
@@ -120,9 +154,10 @@ async def create_telemetry(telemetry_data: TelemetryCreate, current_user: dict =
     
     try:
         cursor.execute("""
-            INSERT INTO telemetry (device_id, energy_usage, voltage, current, power_factor, temperature, humidity, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO telemetry (user_id, device_id, energy_usage, voltage, current, power_factor, temperature, humidity, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
+            current_user["sub"], # Use the username from the token
             telemetry_data.device_id,
             telemetry_data.energy_usage,
             telemetry_data.voltage,
@@ -143,7 +178,7 @@ async def create_telemetry(telemetry_data: TelemetryCreate, current_user: dict =
         
         return TelemetryResponse(
             id=telemetry[0],
-            device_id=telemetry[1],
+            device_id=telemetry[1], # device_id is at index 1 (user_id is at index 11)
             timestamp=telemetry[2],
             energy_usage=telemetry[3],
             voltage=telemetry[4],
@@ -169,12 +204,13 @@ async def get_telemetry(
     limit: int = Query(100, description="Maximum number of records to return"),
     current_user: dict = Depends(get_current_user)
 ):
-    """Get telemetry data with optional filtering"""
+    """Get telemetry data with optional filtering - USER ISOLATED"""
     conn = sqlite3.connect('telemetry.db')
     cursor = conn.cursor()
     
-    query = "SELECT * FROM telemetry WHERE 1=1"
-    params = []
+    # Always filter by current user for data isolation
+    query = "SELECT * FROM telemetry WHERE user_id = ?"
+    params = [current_user["sub"]]  # username from JWT token
     
     if device_id:
         query += " AND device_id = ?"
@@ -198,7 +234,7 @@ async def get_telemetry(
     return [
         TelemetryResponse(
             id=row[0],
-            device_id=row[1],
+            device_id=row[1], # device_id is at index 1 (user_id is at index 11)
             timestamp=row[2],
             energy_usage=row[3],
             voltage=row[4],
@@ -311,7 +347,7 @@ async def get_device_health(
         recommendations.append("Device may be experiencing connectivity issues")
     if error_count > 0:
         recommendations.append("Device has reported errors - check device status")
-    if latest[7] and latest[7] > 80:  # temperature > 80
+    if latest[7] and latest[7] > 80:  # temperature > 7
         recommendations.append("Device temperature is high - check ventilation")
     
     return DeviceHealth(
@@ -326,19 +362,99 @@ async def get_device_health(
 
 @app.get("/telemetry/devices/summary")
 async def get_devices_summary(current_user: dict = Depends(get_current_user)):
-    """Get summary of all devices and their latest status"""
+    """Get summary of all devices for the current user with latest telemetry"""
+    conn = sqlite3.connect('telemetry.db')
+    cursor = conn.cursor()
+    
+    # Get user's devices with latest telemetry data
+    cursor.execute("""
+        SELECT ud.device_id, ud.device_name, ud.device_type, ud.location, ud.is_active,
+               t.energy_usage, t.timestamp, t.status
+        FROM user_devices ud
+        LEFT JOIN (
+            SELECT device_id, energy_usage, timestamp, status,
+                   ROW_NUMBER() OVER (PARTITION BY device_id ORDER BY timestamp DESC) as rn
+            FROM telemetry 
+            WHERE user_id = ?
+        ) t ON ud.device_id = t.device_id AND t.rn = 1
+        WHERE ud.user_id = ?
+        ORDER BY ud.created_at DESC
+    """, (current_user["sub"], current_user["sub"]))
+    
+    devices = cursor.fetchall()
+    conn.close()
+    
+    return {
+        "user_id": current_user["sub"],
+        "total_devices": len(devices),
+        "active_devices": len([d for d in devices if d[4]]),  # is_active
+        "devices": [
+            {
+                "device_id": device[0],
+                "device_name": device[1],
+                "device_type": device[2],
+                "location": device[3],
+                "is_active": bool(device[4]),
+                "last_energy_usage": device[5],
+                "last_seen": device[6],
+                "status": device[7] or "unknown"
+            }
+            for device in devices
+        ]
+    }
+
+# User Device Management Endpoints
+@app.post("/devices", status_code=status.HTTP_201_CREATED)
+async def create_user_device(
+    device_data: dict,
+    current_user: dict = Depends(get_current_user)
+):
+    """Create a new device for the current user"""
+    conn = sqlite3.connect('telemetry.db')
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            INSERT INTO user_devices (user_id, device_id, device_name, device_type, location)
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            current_user["sub"],
+            device_data.get("device_id"),
+            device_data.get("device_name", "Unknown Device"),
+            device_data.get("device_type", "Smart Device"),
+            device_data.get("location", "Unknown Location")
+        ))
+        
+        conn.commit()
+        conn.close()
+        
+        return {"message": "Device created successfully", "device_id": device_data.get("device_id")}
+        
+    except sqlite3.IntegrityError:
+        conn.close()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Device ID already exists for this user"
+        )
+    except Exception as e:
+        conn.close()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create device: {str(e)}"
+        )
+
+@app.get("/devices")
+async def get_user_devices(current_user: dict = Depends(get_current_user)):
+    """Get all devices for the current user"""
     conn = sqlite3.connect('telemetry.db')
     cursor = conn.cursor()
     
     cursor.execute("""
-        SELECT DISTINCT device_id, 
-               MAX(timestamp) as last_seen,
-               MAX(energy_usage) as latest_energy,
-               COUNT(*) as total_readings
-        FROM telemetry 
-        GROUP BY device_id
-        ORDER BY last_seen DESC
-    """)
+        SELECT device_id, device_name, device_type, location, is_active, created_at
+        FROM user_devices 
+        WHERE user_id = ?
+        ORDER BY created_at DESC
+    """, (current_user["sub"],))
     
     devices = cursor.fetchall()
     conn.close()
@@ -346,9 +462,11 @@ async def get_devices_summary(current_user: dict = Depends(get_current_user)):
     return [
         {
             "device_id": device[0],
-            "last_seen": device[1],
-            "latest_energy": device[2],
-            "total_readings": device[3]
+            "device_name": device[1],
+            "device_type": device[2],
+            "location": device[3],
+            "is_active": bool(device[4]),
+            "created_at": device[5]
         }
         for device in devices
     ]

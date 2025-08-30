@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import authService from './services/auth';
+import TelemetryDashboard from './components/TelemetryDashboard';
 function App() {
   const [isLogin, setIsLogin] = useState(true);
   const [formData, setFormData] = useState({
@@ -93,31 +94,9 @@ function App() {
     });
   };
 
-  // If user is logged in, show dashboard
+  // If user is logged in, show telemetry dashboard
   if (user) {
-    return (
-      <section className="min-h-screen w-full flex items-center justify-center font-mono bg-gradient-to-r from-cyan-500 from-10% via-indigo-500 via-50% to-sky-500 to-100%">
-        <div className="flex flex-col items-center justify-center text-center p-20 gap-8 bg-white rounded-2xl text-gray-900 shadow-2xl">
-          {/* Welcome Message */}
-          <h1 className="text-4xl font-bold">
-            Welcome, {user.username}!
-          </h1>
-
-          <div className="flex flex-col gap-4 text-left">
-            <p><strong>Email:</strong> {user.email}</p>
-            <p><strong>Role:</strong> {user.role}</p>
-            <p><strong>Member since:</strong> {new Date(user.created_at).toLocaleDateString()}</p>
-          </div>
-
-          <button
-            onClick={handleLogout}
-            className="bg-red-500 hover:bg-red-600 text-white p-3 rounded-md transition-colors text-base font-medium"
-          >
-            Logout
-          </button>
-        </div>
-      </section>
-    );
+    return <TelemetryDashboard user={user} onLogout={handleLogout} />;
   }
 
   // Login/Register Form

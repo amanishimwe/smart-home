@@ -53,6 +53,8 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         username: str = payload.get("sub")
         if username is None:
             raise credentials_exception
+        # Add the original token to the payload for forwarding to other services
+        payload["token"] = credentials.credentials
     except JWTError:
         raise credentials_exception
     
