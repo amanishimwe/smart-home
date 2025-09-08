@@ -1,5 +1,5 @@
 // src/services/telemetry.js
-const API_BASE_URL = 'http://localhost:8003'; // Telemetry service
+const API_BASE_URL = 'http://localhost:8000'; // API Gateway
 
 class TelemetryService {
     constructor() {

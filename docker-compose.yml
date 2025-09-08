@@ -1,86 +1,202 @@
-version: '3.8'
-
 services:
-  # API Gateway
-  api-gateway:
-    build: ./api-gateway
-    ports:
-      - "8000:8000"
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    restart: always
     environment:
-      - SECRET_KEY=your-secret-key-here-change-in-production
-    depends_on:
-      - auth-service
-      - user-service
-      - telemetry-service
-      - ai-service
+      POSTGRES_DB: smarthome
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./database/init:/docker-entrypoint-initdb.d/
     networks:
       - smart-home-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d smarthome"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   # Authentication Service
   auth-service:
-    build: ./auth-service
+    build: 
+      context: .
+      dockerfile: ./auth-service/Dockerfile
     ports:
       - "8001:8001"
     environment:
-      - SECRET_KEY=your-secret-key-here-change-in-production
-    volumes:
-      - auth-data:/app/data
+      - SECRET_KEY=your-secret-key-here-change-in-production-2024
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=smarthome
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
     networks:
       - smart-home-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   # User Service
   user-service:
-    build: ./user-service
+    build:
+      context: .
+      dockerfile: ./user-service/Dockerfile
     ports:
       - "8002:8002"
     environment:
-      - SECRET_KEY=your-secret-key-here-change-in-production
-    volumes:
-      - user-data:/app/data
+      - SECRET_KEY=your-secret-key-here-change-in-production-2024
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=smarthome
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
     networks:
       - smart-home-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   # Telemetry Service
   telemetry-service:
-    build: ./telemetry-service
+    build:
+      context: .
+      dockerfile: ./telemetry-service/Dockerfile
     ports:
       - "8003:8003"
     environment:
-      - SECRET_KEY=your-secret-key-here-change-in-production
-    volumes:
-      - telemetry-data:/app/data
+      - SECRET_KEY=your-secret-key-here-change-in-production-2024
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=smarthome
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
     networks:
       - smart-home-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   # AI Service
   ai-service:
-    build: ./ai-service
+    build:
+      context: .
+      dockerfile: ./ai-service/Dockerfile
     ports:
       - "8004:8004"
     environment:
-      - SECRET_KEY=your-secret-key-here-change-in-production
-    volumes:
-      - ai-data:/app/data
+      - SECRET_KEY=your-secret-key-here-change-in-production-2024
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=smarthome
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
     networks:
       - smart-home-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # API Gateway
+  api-gateway:
+    build:
+      context: .
+      dockerfile: ./api-gateway/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - SECRET_KEY=your-secret-key-here-change-in-production-2024
+      - AUTH_SERVICE_URL=http://auth-service:8001
+      - USER_SERVICE_URL=http://user-service:8002
+      - TELEMETRY_SERVICE_URL=http://telemetry-service:8003
+      - AI_SERVICE_URL=http://ai-service:8004
+    depends_on:
+      auth-service:
+        condition: service_healthy
+      user-service:
+        condition: service_healthy
+      telemetry-service:
+        condition: service_healthy
+      ai-service:
+        condition: service_healthy
+    networks:
+      - smart-home-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   # Frontend (React)
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
     ports:
-      - "5173:5173"
+      - "3000:80"
     environment:
       - VITE_API_URL=http://localhost:8000
     depends_on:
-      - api-gateway
+      api-gateway:
+        condition: service_healthy
+    networks:
+      - smart-home-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Cleanup Service for removing old images and volumes
+  cleanup:
+    image: docker:cli
+    profiles:
+      - cleanup
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: >
+      sh -c "
+        echo 'Starting Docker cleanup...' &&
+        docker system prune -f --volumes &&
+        docker image prune -a -f &&
+        docker builder prune -f &&
+        echo 'Docker cleanup completed!'
+      "
     networks:
       - smart-home-network
 
 volumes:
-  auth-data:
-  user-data:
-  telemetry-data:
-  ai-data:
+  postgres-data:
+    driver: local
 
 networks:
   smart-home-network:

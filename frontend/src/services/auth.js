@@ -1,5 +1,5 @@
 // src/services/auth.js
-const API_BASE_URL = 'http://localhost:8001'; // API Gateway
+const API_BASE_URL = 'http://localhost:8000'; // API Gateway
 
 class AuthService {
     constructor() {

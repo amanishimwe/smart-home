@@ -18,7 +18,8 @@ function App() {
   useEffect(() => {
     const existingUser = authService.getUser();
     if (existingUser) {
-      setUser(existingUser);
+      setUser(existingUser)
+      ;
     }
   }, []);
 

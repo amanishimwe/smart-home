@@ -2,16 +2,16 @@ from fastapi import FastAPI, HTTPException, Depends, status, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
-import sqlite3
 import os
 import sys
 from typing import List, Optional
 from datetime import datetime, timedelta
 import json
+import logging
 
-# Add shared models to path
-sys.path.append('../shared')
-from models import TelemetryCreate, TelemetryResponse, TelemetryQuery, EnergyAnalytics, DeviceHealth
+# Import shared models and database
+from shared.models import TelemetryCreate, TelemetryResponse, TelemetryQuery, EnergyAnalytics, DeviceHealth
+from shared.database import execute_query, check_connection
 
 app = FastAPI(
     title="Telemetry Service",
@@ -24,7 +24,7 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173"],
+    allow_origins=["*"],  # In production, specify actual origins
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -36,216 +36,140 @@ ALGORITHM = "HS256"
 
 security = HTTPBearer()
 
-# Database setup
-def init_db():
-    conn = sqlite3.connect('telemetry.db')
-    cursor = conn.cursor()
-    
-    # Create user_devices table for user-device mapping
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS user_devices (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id VARCHAR(100) NOT NULL,  -- username from auth service
-            device_id VARCHAR(100) NOT NULL,
-            device_name VARCHAR(100),
-            device_type VARCHAR(50),
-            location VARCHAR(100),
-            is_active BOOLEAN DEFAULT 1,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(user_id, device_id)
-        )
-    ''')
-    
-    # Create telemetry table with user_id
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS telemetry (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id VARCHAR(100) NOT NULL,  -- username from auth service
-            device_id VARCHAR(100) NOT NULL,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            energy_usage REAL NOT NULL,
-            voltage REAL,
-            current REAL,
-            power_factor REAL,
-            temperature REAL,
-            humidity REAL,
-            status VARCHAR(50) DEFAULT 'active',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Create indexes for better query performance
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_id ON telemetry(user_id)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_device_id ON telemetry(device_id)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON telemetry(timestamp)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_device ON telemetry(user_id, device_id)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_device_timestamp ON telemetry(user_id, device_id, timestamp)')
-    
-    # Add user_id column to existing telemetry table if it doesn't exist
+# JWT token validation
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Validate JWT token and return user info"""
     try:
-        cursor.execute('ALTER TABLE telemetry ADD COLUMN user_id VARCHAR(100)')
-        # Set default user_id for existing data (migration)
-        cursor.execute('UPDATE telemetry SET user_id = "default_user" WHERE user_id IS NULL')
-    except sqlite3.OperationalError:
-        # Column already exists
-        pass
-    
-    # Create indexes after ensuring column exists
-    try:
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_id ON telemetry(user_id)')
-    except sqlite3.OperationalError:
-        # Index creation failed, skip
-        pass
-    
-    conn.commit()
-    conn.close()
-
-init_db()
-
-# Authentication dependency
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    
-    try:
-        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        token = credentials.credentials
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username: str = payload.get("sub")
         if username is None:
-            raise credentials_exception
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authentication credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return payload
     except JWTError:
-        raise credentials_exception
-    
-    return payload
-
-# Utility functions
-def calculate_energy_analytics(telemetry_data: List[tuple]) -> EnergyAnalytics:
-    if not telemetry_data:
-        return None
-    
-    energy_values = [row[3] for row in telemetry_data]  # energy_usage column
-    total_energy = sum(energy_values)
-    average_energy = total_energy / len(energy_values)
-    peak_energy = max(energy_values)
-    
-    # Simple cost estimation (can be made more sophisticated)
-    cost_estimate = total_energy * 0.12  # Assuming $0.12 per kWh
-    carbon_footprint = total_energy * 0.92  # kg CO2 per kWh
-    
-    return EnergyAnalytics(
-        device_id=telemetry_data[0][1],  # device_id
-        period="custom",
-        total_energy=total_energy,
-        average_energy=average_energy,
-        peak_energy=peak_energy,
-        cost_estimate=cost_estimate,
-        carbon_footprint=carbon_footprint,
-        data_points=[]  # Would convert raw data to TelemetryResponse objects
-    )
-
-# API Routes
-@app.post("/telemetry", response_model=TelemetryResponse, status_code=status.HTTP_201_CREATED)
-async def create_telemetry(telemetry_data: TelemetryCreate, current_user: dict = Depends(get_current_user)):
-    """Create new telemetry data point"""
-    conn = sqlite3.connect('telemetry.db')
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute("""
-            INSERT INTO telemetry (user_id, device_id, energy_usage, voltage, current, power_factor, temperature, humidity, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            current_user["sub"], # Use the username from the token
-            telemetry_data.device_id,
-            telemetry_data.energy_usage,
-            telemetry_data.voltage,
-            telemetry_data.current,
-            telemetry_data.power_factor,
-            telemetry_data.temperature,
-            telemetry_data.humidity,
-            telemetry_data.status
-        ))
-        
-        telemetry_id = cursor.lastrowid
-        conn.commit()
-        
-        # Get the created telemetry data
-        cursor.execute("SELECT * FROM telemetry WHERE id = ?", (telemetry_id,))
-        telemetry = cursor.fetchone()
-        conn.close()
-        
-        return TelemetryResponse(
-            id=telemetry[0],
-            device_id=telemetry[1], # device_id is at index 1 (user_id is at index 11)
-            timestamp=telemetry[2],
-            energy_usage=telemetry[3],
-            voltage=telemetry[4],
-            current=telemetry[5],
-            power_factor=telemetry[6],
-            temperature=telemetry[7],
-            humidity=telemetry[8],
-            status=telemetry[9]
-        )
-        
-    except Exception as e:
-        conn.close()
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create telemetry: {str(e)}"
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
-@app.get("/telemetry", response_model=List[TelemetryResponse])
-async def get_telemetry(
-    device_id: Optional[str] = Query(None, description="Filter by device ID"),
-    start_time: Optional[datetime] = Query(None, description="Start time for filtering"),
-    end_time: Optional[datetime] = Query(None, description="End time for filtering"),
-    limit: int = Query(100, description="Maximum number of records to return"),
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database connection on startup"""
+    if not check_connection():
+        logging.error("Failed to connect to database")
+        raise Exception("Database connection failed")
+    logging.info("Telemetry service started successfully")
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    try:
+        db_status = check_connection()
+        return {
+            "status": "healthy" if db_status else "unhealthy",
+            "service": "telemetry-service",
+            "database": "connected" if db_status else "disconnected",
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "service": "telemetry-service", 
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
+
+# Telemetry Data Endpoints
+@app.post("/telemetry", status_code=status.HTTP_201_CREATED)
+async def create_telemetry_data(
+    telemetry_data: TelemetryCreate,
     current_user: dict = Depends(get_current_user)
 ):
-    """Get telemetry data with optional filtering - USER ISOLATED"""
-    conn = sqlite3.connect('telemetry.db')
-    cursor = conn.cursor()
-    
-    # Always filter by current user for data isolation
-    query = "SELECT * FROM telemetry WHERE user_id = ?"
-    params = [current_user["sub"]]  # username from JWT token
-    
-    if device_id:
-        query += " AND device_id = ?"
-        params.append(device_id)
-    
-    if start_time:
-        query += " AND timestamp >= ?"
-        params.append(start_time.isoformat())
-    
-    if end_time:
-        query += " AND timestamp <= ?"
-        params.append(end_time.isoformat())
-    
-    query += " ORDER BY timestamp DESC LIMIT ?"
-    params.append(limit)
-    
-    cursor.execute(query, params)
-    telemetry_data = cursor.fetchall()
-    conn.close()
-    
-    return [
-        TelemetryResponse(
-            id=row[0],
-            device_id=row[1], # device_id is at index 1 (user_id is at index 11)
-            timestamp=row[2],
-            energy_usage=row[3],
-            voltage=row[4],
-            current=row[5],
-            power_factor=row[6],
-            temperature=row[7],
-            humidity=row[8],
-            status=row[9]
+    """Create new telemetry data point"""
+    try:
+        query = """
+            INSERT INTO telemetry (user_id, device_id, temperature, humidity, energy_usage, status, timestamp)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+        """
+        
+        result = execute_query(query, (
+            current_user["sub"],
+            telemetry_data.device_id,
+            telemetry_data.temperature,
+            telemetry_data.humidity,
+            telemetry_data.energy_usage,
+            telemetry_data.status,
+            telemetry_data.timestamp or datetime.now()
+        ))
+        
+        if result:
+            return {"message": "Telemetry data created successfully", "id": result[0][0]}
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to create telemetry data"
+            )
+    except Exception as e:
+        logging.error(f"Error creating telemetry data: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create telemetry data: {str(e)}"
         )
-        for row in telemetry_data
-    ]
+
+@app.get("/telemetry")
+async def get_telemetry_data(
+    device_id: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=1000),
+    current_user: dict = Depends(get_current_user)
+):
+    """Get telemetry data for the current user"""
+    try:
+        if device_id:
+            query = """
+                SELECT id, user_id, device_id, temperature, humidity, energy_usage, status, timestamp
+                FROM telemetry 
+                WHERE user_id = %s AND device_id = %s
+                ORDER BY timestamp DESC 
+                LIMIT %s
+            """
+            params = (current_user["sub"], device_id, limit)
+        else:
+            query = """
+                SELECT id, user_id, device_id, temperature, humidity, energy_usage, status, timestamp
+                FROM telemetry 
+                WHERE user_id = %s
+                ORDER BY timestamp DESC 
+                LIMIT %s
+            """
+            params = (current_user["sub"], limit)
+        
+        telemetry_data = execute_query(query, params)
+        
+        return [
+            TelemetryResponse(
+                id=row[0],
+                user_id=row[1],
+                device_id=row[2],
+                temperature=row[3],
+                humidity=row[4],
+                energy_usage=row[5],
+                status=row[6],
+                timestamp=row[7]
+            )
+            for row in telemetry_data
+        ]
+    except Exception as e:
+        logging.error(f"Error fetching telemetry data: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch telemetry data: {str(e)}"
+        )
 
 @app.get("/telemetry/{device_id}/analytics")
 async def get_device_analytics(
@@ -254,44 +178,53 @@ async def get_device_analytics(
     current_user: dict = Depends(get_current_user)
 ):
     """Get energy analytics for a specific device"""
-    conn = sqlite3.connect('telemetry.db')
-    cursor = conn.cursor()
-    
-    # Calculate time range based on period
-    now = datetime.now()
-    if period == "daily":
-        start_time = now - timedelta(days=1)
-    elif period == "weekly":
-        start_time = now - timedelta(weeks=1)
-    elif period == "monthly":
-        start_time = now - timedelta(days=30)
-    elif period == "yearly":
-        start_time = now - timedelta(days=365)
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid period. Use: daily, weekly, monthly, yearly"
+    try:
+        # Calculate time range based on period
+        now = datetime.now()
+        if period == "daily":
+            start_time = now - timedelta(days=1)
+        elif period == "weekly":
+            start_time = now - timedelta(weeks=1)
+        elif period == "monthly":
+            start_time = now - timedelta(days=30)
+        elif period == "yearly":
+            start_time = now - timedelta(days=365)
+        else:
+            start_time = now - timedelta(days=7)  # Default to weekly
+        
+        query = """
+            SELECT AVG(energy_usage), MAX(energy_usage), MIN(energy_usage), COUNT(*)
+            FROM telemetry 
+            WHERE device_id = %s AND timestamp >= %s AND user_id = %s
+        """
+        
+        stats = execute_query(query, (device_id, start_time, current_user["sub"]))
+        
+        if not stats or not stats[0] or stats[0][0] is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No telemetry data found for device {device_id}"
+            )
+        
+        stat_row = stats[0]
+        analytics = EnergyAnalytics(
+            device_id=device_id,
+            average_usage=float(stat_row[0]),
+            peak_usage=float(stat_row[1]),
+            min_usage=float(stat_row[2]),
+            total_readings=int(stat_row[3]),
+            period_start=start_time.isoformat(),
+            period_end=now.isoformat()
         )
-    
-    cursor.execute("""
-        SELECT * FROM telemetry 
-        WHERE device_id = ? AND timestamp >= ?
-        ORDER BY timestamp DESC
-    """, (device_id, start_time.isoformat()))
-    
-    telemetry_data = cursor.fetchall()
-    conn.close()
-    
-    if not telemetry_data:
+        
+        analytics.period = period
+        return analytics
+    except Exception as e:
+        logging.error(f"Error getting analytics for device {device_id}: {e}")
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No telemetry data found for device {device_id} in the specified period"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get analytics: {str(e)}"
         )
-    
-    analytics = calculate_energy_analytics(telemetry_data)
-    analytics.period = period
-    
-    return analytics
 
 @app.get("/telemetry/{device_id}/health")
 async def get_device_health(
@@ -299,90 +232,97 @@ async def get_device_health(
     current_user: dict = Depends(get_current_user)
 ):
     """Get device health status and recommendations"""
-    conn = sqlite3.connect('telemetry.db')
-    cursor = conn.cursor()
-    
-    # Get latest telemetry
-    cursor.execute("""
-        SELECT * FROM telemetry 
-        WHERE device_id = ? 
-        ORDER BY timestamp DESC 
-        LIMIT 1
-    """, (device_id,))
-    
-    latest = cursor.fetchone()
-    
-    if not latest:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No telemetry data found for device {device_id}"
+    try:
+        # Get latest telemetry
+        query = """
+            SELECT * FROM telemetry 
+            WHERE device_id = %s 
+            ORDER BY timestamp DESC 
+            LIMIT 1
+        """
+        
+        latest_data = execute_query(query, (device_id,))
+        
+        if not latest_data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No telemetry data found for device {device_id}"
+            )
+        
+        latest = latest_data[0]
+        
+        # Get data from last 24 hours for uptime calculation
+        yesterday = datetime.now() - timedelta(days=1)
+        count_query = """
+            SELECT COUNT(*) FROM telemetry 
+            WHERE device_id = %s AND timestamp >= %s
+        """
+        
+        recent_count_data = execute_query(count_query, (device_id, yesterday.isoformat()))
+        recent_count = recent_count_data[0][0] if recent_count_data else 0
+        
+        # Get error count (status != 'active')
+        error_query = """
+            SELECT COUNT(*) FROM telemetry 
+            WHERE device_id = %s AND status != 'active'
+        """
+        
+        error_count_data = execute_query(error_query, (device_id,))
+        error_count = error_count_data[0][0] if error_count_data else 0
+        
+        # Calculate uptime percentage (assuming data points every hour)
+        expected_points = 24
+        uptime_percentage = (recent_count / expected_points) * 100 if expected_points > 0 else 0
+        
+        # Generate recommendations
+        recommendations = []
+        if uptime_percentage < 80:
+            recommendations.append("Device connectivity issues detected. Check network connection.")
+        if error_count > 5:
+            recommendations.append("Multiple errors detected. Device may require maintenance.")
+        if latest[4] and float(latest[4]) > 100:  # energy_usage
+            recommendations.append("High energy consumption detected. Consider optimization.")
+        
+        return DeviceHealth(
+            device_id=device_id,
+            status=latest[6],  # status
+            last_seen=latest[7],  # timestamp
+            uptime_percentage=uptime_percentage,
+            error_count=error_count,
+            maintenance_due=error_count > 5 or uptime_percentage < 80,
+            recommendations=recommendations
         )
-    
-    # Get data from last 24 hours for uptime calculation
-    yesterday = datetime.now() - timedelta(days=1)
-    cursor.execute("""
-        SELECT COUNT(*) FROM telemetry 
-        WHERE device_id = ? AND timestamp >= ?
-    """, (device_id, yesterday.isoformat()))
-    
-    recent_count = cursor.fetchone()[0]
-    
-    # Get error count (status != 'active')
-    cursor.execute("""
-        SELECT COUNT(*) FROM telemetry 
-        WHERE device_id = ? AND status != 'active'
-    """, (device_id,))
-    
-    error_count = cursor.fetchone()[0]
-    
-    conn.close()
-    
-    # Calculate uptime percentage (assuming data points every hour)
-    expected_points = 24
-    uptime_percentage = (recent_count / expected_points) * 100 if expected_points > 0 else 0
-    
-    # Generate recommendations
-    recommendations = []
-    if uptime_percentage < 90:
-        recommendations.append("Device may be experiencing connectivity issues")
-    if error_count > 0:
-        recommendations.append("Device has reported errors - check device status")
-    if latest[7] and latest[7] > 80:  # temperature > 7
-        recommendations.append("Device temperature is high - check ventilation")
-    
-    return DeviceHealth(
-        device_id=device_id,
-        status=latest[9],  # status
-        last_seen=latest[2],  # timestamp
-        uptime_percentage=uptime_percentage,
-        error_count=error_count,
-        maintenance_due=error_count > 5 or uptime_percentage < 80,
-        recommendations=recommendations
-    )
+    except Exception as e:
+        logging.error(f"Error getting device health: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get device health: {str(e)}"
+        )
 
 @app.get("/telemetry/devices/summary")
 async def get_devices_summary(current_user: dict = Depends(get_current_user)):
     """Get summary of all devices for the current user with latest telemetry"""
-    conn = sqlite3.connect('telemetry.db')
-    cursor = conn.cursor()
-    
-    # Get user's devices with latest telemetry data
-    cursor.execute("""
-        SELECT ud.device_id, ud.device_name, ud.device_type, ud.location, ud.is_active,
-               t.energy_usage, t.timestamp, t.status
-        FROM user_devices ud
-        LEFT JOIN (
-            SELECT device_id, energy_usage, timestamp, status,
-                   ROW_NUMBER() OVER (PARTITION BY device_id ORDER BY timestamp DESC) as rn
-            FROM telemetry 
-            WHERE user_id = ?
-        ) t ON ud.device_id = t.device_id AND t.rn = 1
-        WHERE ud.user_id = ?
-        ORDER BY ud.created_at DESC
-    """, (current_user["sub"], current_user["sub"]))
-    
-    devices = cursor.fetchall()
-    conn.close()
+    try:
+        # Get user's devices with latest telemetry data using PostgreSQL
+        query = """
+            SELECT ud.device_id, ud.device_name, ud.device_type, ud.location, ud.is_active,
+                   t.energy_usage, t.timestamp, t.status
+            FROM user_devices ud
+            LEFT JOIN (
+                SELECT device_id, energy_usage, timestamp, status,
+                       ROW_NUMBER() OVER (PARTITION BY device_id ORDER BY timestamp DESC) as rn
+                FROM telemetry 
+                WHERE user_id = %s
+            ) t ON ud.device_id = t.device_id AND t.rn = 1
+            WHERE ud.user_id = %s
+            ORDER BY ud.created_at DESC
+        """
+        
+        devices = execute_query(query, (current_user["sub"], current_user["sub"]))
+    except Exception as e:
+        # Return empty result if query fails
+        logging.error(f"Error getting devices summary: {e}")
+        devices = []
     
     return {
         "user_id": current_user["sub"],
@@ -394,10 +334,10 @@ async def get_devices_summary(current_user: dict = Depends(get_current_user)):
                 "device_name": device[1],
                 "device_type": device[2],
                 "location": device[3],
-                "is_active": bool(device[4]),
-                "last_energy_usage": device[5],
-                "last_seen": device[6],
-                "status": device[7] or "unknown"
+                "is_active": device[4],
+                "latest_energy_usage": device[5],
+                "last_update": device[6],
+                "status": device[7]
             }
             for device in devices
         ]
@@ -410,14 +350,14 @@ async def create_user_device(
     current_user: dict = Depends(get_current_user)
 ):
     """Create a new device for the current user"""
-    conn = sqlite3.connect('telemetry.db')
-    cursor = conn.cursor()
-    
     try:
-        cursor.execute("""
+        query = """
             INSERT INTO user_devices (user_id, device_id, device_name, device_type, location)
-            VALUES (?, ?, ?, ?, ?)
-        """, (
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING device_id
+        """
+        
+        result = execute_query(query, (
             current_user["sub"],
             device_data.get("device_id"),
             device_data.get("device_name", "Unknown Device"),
@@ -425,19 +365,15 @@ async def create_user_device(
             device_data.get("location", "Unknown Location")
         ))
         
-        conn.commit()
-        conn.close()
-        
-        return {"message": "Device created successfully", "device_id": device_data.get("device_id")}
-        
-    except sqlite3.IntegrityError:
-        conn.close()
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Device ID already exists for this user"
-        )
+        if result:
+            return {"message": "Device created successfully", "device_id": result[0][0]}
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to create device"
+            )
     except Exception as e:
-        conn.close()
+        logging.error(f"Error creating device: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create device: {str(e)}"
@@ -446,30 +382,33 @@ async def create_user_device(
 @app.get("/devices")
 async def get_user_devices(current_user: dict = Depends(get_current_user)):
     """Get all devices for the current user"""
-    conn = sqlite3.connect('telemetry.db')
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT device_id, device_name, device_type, location, is_active, created_at
-        FROM user_devices 
-        WHERE user_id = ?
-        ORDER BY created_at DESC
-    """, (current_user["sub"],))
-    
-    devices = cursor.fetchall()
-    conn.close()
-    
-    return [
-        {
-            "device_id": device[0],
-            "device_name": device[1],
-            "device_type": device[2],
-            "location": device[3],
-            "is_active": bool(device[4]),
-            "created_at": device[5]
-        }
-        for device in devices
-    ]
+    try:
+        query = """
+            SELECT device_id, device_name, device_type, location, is_active, created_at
+            FROM user_devices 
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+        """
+        
+        devices = execute_query(query, (current_user["sub"],))
+        
+        return [
+            {
+                "device_id": device[0],
+                "device_name": device[1], 
+                "device_type": device[2],
+                "location": device[3],
+                "is_active": device[4],
+                "created_at": device[5]
+            }
+            for device in devices
+        ]
+    except Exception as e:
+        logging.error(f"Error getting user devices: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get devices: {str(e)}"
+        )
 
 @app.delete("/telemetry/{telemetry_id}")
 async def delete_telemetry(
@@ -477,33 +416,17 @@ async def delete_telemetry(
     current_user: dict = Depends(get_current_user)
 ):
     """Delete specific telemetry record (admin only)"""
-    # Check if user is admin (you might want to implement proper role checking)
-    conn = sqlite3.connect('telemetry.db')
-    cursor = conn.cursor()
-    
-    cursor.execute("DELETE FROM telemetry WHERE id = ?", (telemetry_id,))
-    
-    if cursor.rowcount == 0:
-        conn.close()
+    try:
+        query = "DELETE FROM telemetry WHERE id = %s AND user_id = %s"
+        result = execute_query(query, (telemetry_id, current_user["sub"]))
+        
+        return {"message": f"Telemetry record {telemetry_id} deleted successfully"}
+    except Exception as e:
+        logging.error(f"Error deleting telemetry: {e}")
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Telemetry record {telemetry_id} not found"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete telemetry: {str(e)}"
         )
-    
-    conn.commit()
-    conn.close()
-    
-    return {"message": f"Telemetry record {telemetry_id} deleted successfully"}
-
-@app.get("/health")
-async def health_check():
-    """Service health check"""
-    return {
-        "status": "healthy",
-        "service": "telemetry-service",
-        "timestamp": datetime.now().isoformat(),
-        "database": "connected"
-    }
 
 if __name__ == "__main__":
     import uvicorn

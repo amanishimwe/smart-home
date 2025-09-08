@@ -4,14 +4,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
-import sqlite3
 import os
 from typing import Optional
 import sys
+import logging
 
-# Add shared models to path
-sys.path.append('../shared')
-from models import UserCreate, UserLogin, UserResponse, Token, UserRole
+# Import shared models and database
+from shared.models import UserCreate, UserLogin, UserResponse, Token, UserRole
+from shared.database import execute_query, check_connection
 
 app = FastAPI(
     title="Auth Service", 
@@ -41,23 +41,38 @@ security = HTTPBearer()
 
 # Database setup
 def init_db():
-    conn = sqlite3.connect('auth.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username VARCHAR(50) UNIQUE NOT NULL,
-            email VARCHAR(100) UNIQUE NOT NULL,
-            password_hash VARCHAR(255) NOT NULL,
-            role VARCHAR(20) DEFAULT 'user',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            is_active BOOLEAN DEFAULT 1
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    try:
+        execute_query('''
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username VARCHAR(50) UNIQUE NOT NULL,
+                email VARCHAR(100) UNIQUE NOT NULL,
+                password_hash VARCHAR(255) NOT NULL,
+                role VARCHAR(20) DEFAULT 'user',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_active BOOLEAN DEFAULT TRUE
+            )
+        ''', fetch=False)
+        logging.info("Auth database initialized successfully")
+    except Exception as e:
+        logging.error(f"Failed to initialize auth database: {e}")
+        raise
 
-init_db()
+# Initialize database on startup
+@app.on_event("startup")
+async def startup_event():
+    # Wait for database to be ready
+    import time
+    max_retries = 30
+    for i in range(max_retries):
+        if check_connection():
+            init_db()
+            break
+        else:
+            logging.info(f"Waiting for database... ({i+1}/{max_retries})")
+            time.sleep(2)
+    else:
+        raise Exception("Could not connect to database after maximum retries")
 
 # Utility functions
 def verify_password(plain_password: str, hashed_password: str) -> bool:
@@ -77,53 +92,46 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 def get_user_by_username(username: str):
-    conn = sqlite3.connect('auth.db')
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
-    user = cursor.fetchone()
-    conn.close()
-    return dict(user) if user else None
+    try:
+        result = execute_query("SELECT * FROM users WHERE username = %s", (username,))
+        return dict(result[0]) if result else None
+    except Exception as e:
+        logging.error(f"Error getting user by username: {e}")
+        return None
 
 def get_user_by_email(email: str):
-    conn = sqlite3.connect('auth.db')
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE email = ?", (email,))
-    user = cursor.fetchone()
-    conn.close()
-    return dict(user) if user else None
+    try:
+        result = execute_query("SELECT * FROM users WHERE email = %s", (email,))
+        return dict(result[0]) if result else None
+    except Exception as e:
+        logging.error(f"Error getting user by email: {e}")
+        return None
 
 def create_user(user_data: UserCreate):
-    conn = sqlite3.connect('auth.db')
-    cursor = conn.cursor()
-    
     hashed_password = get_password_hash(user_data.password)
     
     try:
-        cursor.execute("""
+        # Insert user and return the created user
+        execute_query("""
             INSERT INTO users (username, email, password_hash, role)
-            VALUES (?, ?, ?, ?)
-        """, (user_data.username, user_data.email, hashed_password, user_data.role.value))
-        
-        user_id = cursor.lastrowid
-        conn.commit()
+            VALUES (%s, %s, %s, %s)
+        """, (user_data.username, user_data.email, hashed_password, user_data.role.value), fetch=False)
         
         # Get the created user
-        cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-        user = cursor.fetchone()
-        conn.close()
-        
-        return {
-            "id": user[0],
-            "username": user[1],
-            "email": user[2],
-            "role": user[4],
-            "created_at": user[5],
-            "is_active": user[6]
-        }
-    except sqlite3.IntegrityError:
-        conn.close()
+        result = execute_query("SELECT * FROM users WHERE username = %s", (user_data.username,))
+        if result:
+            user = result[0]
+            return {
+                "id": user[0],
+                "username": user[1],
+                "email": user[2],
+                "role": user[4],
+                "created_at": user[5],
+                "is_active": user[6]
+            }
+        return None
+    except Exception as e:
+        logging.error(f"Error creating user: {e}")
         return None
 
 # API Routes

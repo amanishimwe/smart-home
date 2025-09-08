@@ -2,14 +2,14 @@ from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from jose import JWTError, jwt
-import sqlite3
 import os
 import sys
 from typing import List
+import logging
 
-# Add shared models to path
-sys.path.append('../shared')
-from models import UserResponse, UserRole
+# Import shared models and database
+from shared.models import UserResponse, UserRole
+from shared.database import execute_query, check_connection
 
 app = FastAPI(title="User Service", version="1.0.0")
 
@@ -30,25 +30,40 @@ security = HTTPBearer()
 
 # Database setup
 def init_db():
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS user_profiles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER UNIQUE NOT NULL,
-            first_name VARCHAR(50),
-            last_name VARCHAR(50),
-            phone VARCHAR(20),
-            address TEXT,
-            preferences TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    try:
+        execute_query('''
+            CREATE TABLE IF NOT EXISTS user_profiles (
+                id SERIAL PRIMARY KEY,
+                user_id VARCHAR(100) UNIQUE NOT NULL,
+                first_name VARCHAR(50),
+                last_name VARCHAR(50),
+                phone VARCHAR(20),
+                address TEXT,
+                preferences TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''', fetch=False)
+        logging.info("User service database initialized successfully")
+    except Exception as e:
+        logging.error(f"Failed to initialize user service database: {e}")
+        raise
 
-init_db()
+# Initialize database on startup
+@app.on_event("startup")
+async def startup_event():
+    # Wait for database to be ready
+    import time
+    max_retries = 30
+    for i in range(max_retries):
+        if check_connection():
+            init_db()
+            break
+        else:
+            logging.info(f"Waiting for database... ({i+1}/{max_retries})")
+            time.sleep(2)
+    else:
+        raise Exception("Could not connect to database after maximum retries")
 
 # Authentication dependency
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -114,11 +129,8 @@ async def get_user_profile(user_id: int, current_user: dict = Depends(get_curren
         )
     
     # Fetch profile from database
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM user_profiles WHERE user_id = ?", (user_id,))
-    profile = cursor.fetchone()
-    conn.close()
+    result = execute_query("SELECT * FROM user_profiles WHERE user_id = %s", (str(user_id),))
+    profile = result[0] if result else None
     
     if not profile:
         raise HTTPException(
@@ -145,42 +157,36 @@ async def update_user_profile(user_id: int, profile_data: dict, current_user: di
             detail="Can only update own profile"
         )
     
-    # Update profile in database
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    
     # Check if profile exists
-    cursor.execute("SELECT * FROM user_profiles WHERE user_id = ?", (user_id,))
-    if not cursor.fetchone():
+    existing = execute_query("SELECT * FROM user_profiles WHERE user_id = %s", (str(user_id),))
+    
+    if not existing:
         # Create new profile
-        cursor.execute("""
+        execute_query("""
             INSERT INTO user_profiles (user_id, first_name, last_name, phone, address, preferences)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s)
         """, (
-            user_id,
+            str(user_id),
             profile_data.get("first_name"),
             profile_data.get("last_name"),
             profile_data.get("phone"),
             profile_data.get("address"),
             profile_data.get("preferences")
-        ))
+        ), fetch=False)
     else:
         # Update existing profile
-        cursor.execute("""
+        execute_query("""
             UPDATE user_profiles 
-            SET first_name = ?, last_name = ?, phone = ?, address = ?, preferences = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE user_id = ?
+            SET first_name = %s, last_name = %s, phone = %s, address = %s, preferences = %s, updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = %s
         """, (
             profile_data.get("first_name"),
             profile_data.get("last_name"),
             profile_data.get("phone"),
             profile_data.get("address"),
             profile_data.get("preferences"),
-            user_id
-        ))
-    
-    conn.commit()
-    conn.close()
+            str(user_id)
+        ), fetch=False)
     
     return {"message": "Profile updated successfully"}
 

@@ -7,9 +7,8 @@ import os
 import sys
 from typing import Optional
 
-# Add shared models to path
-sys.path.append('../shared')
-from models import UserRole
+# Import shared models
+from shared.models import UserRole
 
 app = FastAPI(
     title="Smart Home API Gateway",
@@ -22,7 +21,7 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173"],
+    allow_origins=["http://localhost:3000", "http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -35,10 +34,10 @@ ALGORITHM = "HS256"
 security = HTTPBearer()
 
 # Service URLs
-AUTH_SERVICE_URL = "http://localhost:8001"
-USER_SERVICE_URL = "http://localhost:8002"
-TELEMETRY_SERVICE_URL = "http://localhost:8003"
-AI_SERVICE_URL = "http://localhost:8004"
+AUTH_SERVICE_URL = os.getenv("AUTH_SERVICE_URL", "http://auth-service:8001")
+USER_SERVICE_URL = os.getenv("USER_SERVICE_URL", "http://user-service:8002")
+TELEMETRY_SERVICE_URL = os.getenv("TELEMETRY_SERVICE_URL", "http://telemetry-service:8003")
+AI_SERVICE_URL = os.getenv("AI_SERVICE_URL", "http://ai-service:8004")
 
 # Authentication dependency
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -220,6 +219,23 @@ async def get_devices_summary(current_user: dict = Depends(get_current_user)):
     async with httpx.AsyncClient() as client:
         headers = {"Authorization": f"Bearer {current_user.get('token')}"}
         response = await client.get(f"{TELEMETRY_SERVICE_URL}/telemetry/devices/summary", headers=headers)
+        return response.json()
+
+# ===== DEVICE MANAGEMENT ROUTES =====
+@app.get("/devices")
+async def get_user_devices(current_user: dict = Depends(get_current_user)):
+    """Get all devices for the current user"""
+    async with httpx.AsyncClient() as client:
+        headers = {"Authorization": f"Bearer {current_user.get('token')}"}
+        response = await client.get(f"{TELEMETRY_SERVICE_URL}/devices", headers=headers)
+        return response.json()
+
+@app.post("/devices")
+async def create_user_device(device_data: dict, current_user: dict = Depends(get_current_user)):
+    """Create a new device for the current user"""
+    async with httpx.AsyncClient() as client:
+        headers = {"Authorization": f"Bearer {current_user.get('token')}"}
+        response = await client.post(f"{TELEMETRY_SERVICE_URL}/devices", json=device_data, headers=headers)
         return response.json()
 
 # ===== AI SERVICE ROUTES =====
